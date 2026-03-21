@@ -1,0 +1,148 @@
+import time
+import os
+import numpy as np
+import torch
+import subprocess
+import shutil
+import sys
+from PIL import Image as PILImage
+from aiohttp import web
+
+import comfy
+import folder_paths
+from server import PromptServer
+from comfy.model_management import InterruptProcessingException
+
+
+class PauseToMask:
+    status_by_id = {}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "invert_mask": ("BOOLEAN", {"default": False}),
+            },
+            "hidden": {
+                "id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("images", "mask")
+    FUNCTION = "execute"
+    CATEGORY = "image"
+    OUTPUT_NODE = True
+
+    def _clipspace_dir(self):
+        path = os.path.join(folder_paths.get_input_directory(), "clipspace")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _save_images(self, images, node_id):
+        clipdir = self._clipspace_dir()
+        ts = int(time.time() * 1000)
+        results = []
+
+        h, w = images[0].shape[:2]
+
+        for b, image in enumerate(images):
+            arr = (255.0 * image.cpu().numpy()).clip(0, 255).astype(np.uint8)
+            pil = PILImage.fromarray(arr).convert("RGBA")
+            fname = f"pause_to_mask_{node_id}_b{b}_{ts}.png"
+            pil.save(os.path.join(clipdir, fname), compress_level=1)
+            results.append({
+                "filename": fname,
+                "subfolder": "clipspace",
+                "type": "input",
+            })
+
+        return results, (w, h)
+
+    def _mask_from_alpha(self, path, size, invert):
+        img = PILImage.open(path).convert("RGBA")
+        alpha = img.getchannel("A")
+        if alpha.size != size:
+            alpha = alpha.resize(size, PILImage.BILINEAR)
+        a = np.asarray(alpha, dtype=np.float32) / 255.0
+        mask = 1.0 - a
+        if invert:
+            mask = 1.0 - mask
+        return torch.from_numpy(mask)
+
+    def execute(self, images, invert_mask=False, id=None, prompt=None):
+        node_id = str(id)
+
+        ui_images, (w, h) = self._save_images(images, node_id)
+        self.status_by_id[node_id] = {
+            "state": "paused",
+            "files": [x["filename"] for x in ui_images],
+        }
+
+        PromptServer.instance.send_sync("executing", {"node": id, "prompt_id": None})
+        PromptServer.instance.send_sync(
+            "executed",
+            {"node": id, "output": {"images": ui_images}, "prompt_id": None},
+        )
+
+        while self.status_by_id[node_id]["state"] == "paused":
+            time.sleep(0.1)
+
+        if self.status_by_id[node_id]["state"] == "cancelled":
+            self.status_by_id.pop(node_id, None)
+            raise InterruptProcessingException()
+
+        clipdir = self._clipspace_dir()
+        masks = []
+        for b in range(images.shape[0]):
+            try:
+                p = os.path.join(clipdir, self.status_by_id[node_id]["files"][b])
+                masks.append(self._mask_from_alpha(p, (w, h), invert_mask))
+            except Exception:
+                masks.append(torch.zeros((h, w)))
+
+        self.status_by_id.pop(node_id, None)
+        return images, torch.stack(masks)
+
+
+@PromptServer.instance.routes.post("/image_preview_pause/continue/{node_id}")
+async def handle_continue(request):
+    node_id = request.match_info["node_id"].strip()
+    if node_id in ImagePreviewPause.status_by_id:
+        ImagePreviewPause.status_by_id[node_id]["state"] = "continue"
+        return web.json_response({"status": "ok", "matched": True})
+    return web.json_response({
+        "status": "ok",
+        "matched": False,
+        "known": list(ImagePreviewPause.status_by_id.keys())
+    })
+    
+
+@PromptServer.instance.routes.post("/image_preview_pause/cancel")
+async def handle_cancel(request):
+    comfy.model_management.interrupt_current_processing()
+    for k in list(PauseToMask.status_by_id):
+        PauseToMask.status_by_id[k]["state"] = "cancelled"
+    return web.json_response({"ok": True})
+
+
+@PromptServer.instance.routes.route("*", "/image_preview_pause/open_in_krita/{node_id}/{batch}")
+async def open_in_krita(request):
+    node_id = request.match_info["node_id"]
+    batch = int(request.match_info["batch"])
+    st = PauseToMask.status_by_id.get(node_id)
+    if not st:
+        return web.json_response({"error": "not paused"}, status=404)
+
+    clipdir = os.path.join(folder_paths.get_input_directory(), "clipspace")
+    path = os.path.join(clipdir, st["files"][batch])
+
+    krita = shutil.which("krita") or shutil.which("krita.exe")
+    if krita:
+        subprocess.Popen([krita, path])
+    else:
+        os.startfile(path) if sys.platform.startswith("win") else subprocess.Popen(["xdg-open", path])
+
+    return web.json_response({"ok": True})
