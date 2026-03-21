@@ -2,8 +2,8 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 /**
- * Use ComfyUI's fetch helper when possible (proxy/base-path safe),
- * fall back to fetch otherwise.
+ * POST helper: uses api.fetchApi when available (proxy-safe).
+ * NOTE: api.fetchApi automatically prefixes /api to the request.
  */
 async function post(path, options = {}) {
   const opts = { method: "POST", ...options };
@@ -17,17 +17,13 @@ async function post(path, options = {}) {
   return res;
 }
 
-
-const postContinue = (nodeId) => post(`/api/pause_to_mask/continue/${nodeId}`);
-const postCancel = () => post(`/api/pause_to_mask/cancel`);
-const postOpenInKrita = (nodeId, batch = 0) => post(`/api/pause_to_mask/open_in_krita/${nodeId}/${batch}`);
-const postMask = async (nodeId, batch, blob) => {
-  const fd = new FormData();
-  fd.append("mask", blob, "mask.png");
-  const res = await post(`/api/pause_to_mask/upload_mask/${nodeId}/${batch}`, { body: fd });
-  return res.json().catch(async () => ({ status: res.status, text: await res.text() }));
-};
-
+// IMPORTANT:
+// We do NOT include "/api" here because api.fetchApi adds it automatically.
+// Backend routes are registered as "/api/pause_to_mask/..." in Python.
+const postContinue = (nodeId) => post(`/pause_to_mask/continue/${nodeId}`);
+const postCancel   = () => post(`/pause_to_mask/cancel`);
+const postOpenInKrita = (nodeId, batch = 0) =>
+  post(`/pause_to_mask/open_in_krita/${nodeId}/${batch}`);
 
 function isTargetNode(node) {
   const comfyClass = node?.comfyClass;
@@ -45,24 +41,26 @@ function isTargetNode(node) {
   );
 }
 
-// ... keep the rest of your mask painter unchanged, except the imports above ...
-
 app.registerExtension({
   name: "pause_to_mask",
+
   nodeCreated(node) {
     if (!isTargetNode(node)) return;
+
+    // Avoid duplicates on reload
     if (node.widgets?.some((w) => w?.name === "✔️ Continue")) return;
 
     node.addWidget("button", "🎨 Send to Krita", "OPEN_KRITA", () => postOpenInKrita(node.id, 0));
-    node.addWidget("button", "🖌️ Edit Mask", "EDIT_MASK", () => createMaskPainter({ nodeId: node.id, initialBatch: 0 }));
     node.addWidget("button", "✔️ Continue", "CONTINUE", () => postContinue(node.id));
     node.addWidget("button", "⛔ Cancel", "CANCEL", () => postCancel());
   },
+
   setup() {
-    const original_api_interrupt = api.interrupt;
+    // If user hits the global interrupt, treat it like cancel
+    const original = api.interrupt;
     api.interrupt = function () {
       postCancel();
-      return original_api_interrupt.apply(this, arguments);
+      return original.apply(this, arguments);
     };
   },
 });
