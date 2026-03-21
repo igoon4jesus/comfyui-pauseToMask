@@ -5,6 +5,7 @@ import torch
 import subprocess
 import shutil
 import sys
+import io
 from PIL import Image as PILImage
 from aiohttp import web
 
@@ -47,18 +48,12 @@ class PauseToMask:
         results = []
 
         h, w = images[0].shape[:2]
-
         for b, image in enumerate(images):
             arr = (255.0 * image.cpu().numpy()).clip(0, 255).astype(np.uint8)
             pil = PILImage.fromarray(arr).convert("RGBA")
             fname = f"pause_to_mask_{node_id}_b{b}_{ts}.png"
             pil.save(os.path.join(clipdir, fname), compress_level=1)
-            results.append({
-                "filename": fname,
-                "subfolder": "clipspace",
-                "type": "input",
-            })
-
+            results.append({"filename": fname, "subfolder": "clipspace", "type": "input"})
         return results, (w, h)
 
     def _mask_from_alpha(self, path, size, invert):
@@ -101,36 +96,42 @@ class PauseToMask:
                 p = os.path.join(clipdir, self.status_by_id[node_id]["files"][b])
                 masks.append(self._mask_from_alpha(p, (w, h), invert_mask))
             except Exception:
-                masks.append(torch.zeros((h, w)))
+                masks.append(torch.zeros((h, w), dtype=torch.float32))
 
         self.status_by_id.pop(node_id, None)
-        return images, torch.stack(masks)
+        return images, torch.stack(masks, dim=0)
 
 
-@PromptServer.instance.routes.post("/image_preview_pause/continue/{node_id}")
+# -------------------------
+# Routes
+# -------------------------
+
+# -------------------------
+# API routes (normalized)
+# -------------------------
+
+@PromptServer.instance.routes.post("/api/pause_to_mask/continue/{node_id}")
 async def handle_continue(request):
     node_id = request.match_info["node_id"].strip()
-    if node_id in ImagePreviewPause.status_by_id:
-        ImagePreviewPause.status_by_id[node_id]["state"] = "continue"
+    if node_id in PauseToMask.status_by_id:
+        PauseToMask.status_by_id[node_id]["state"] = "continue"
         return web.json_response({"status": "ok", "matched": True})
-    return web.json_response({
-        "status": "ok",
-        "matched": False,
-        "known": list(ImagePreviewPause.status_by_id.keys())
-    })
-    
+    return web.json_response(
+        {"status": "ok", "matched": False, "known": list(PauseToMask.status_by_id.keys())}
+    )
 
-@PromptServer.instance.routes.post("/image_preview_pause/cancel")
+
+@PromptServer.instance.routes.post("/api/pause_to_mask/cancel")
 async def handle_cancel(request):
     comfy.model_management.interrupt_current_processing()
-    for k in list(PauseToMask.status_by_id):
+    for k in list(PauseToMask.status_by_id.keys()):
         PauseToMask.status_by_id[k]["state"] = "cancelled"
     return web.json_response({"ok": True})
 
 
-@PromptServer.instance.routes.route("*", "/image_preview_pause/open_in_krita/{node_id}/{batch}")
-async def open_in_krita(request):
-    node_id = request.match_info["node_id"]
+@PromptServer.instance.routes.get("/api/pause_to_mask/temp_image/{node_id}/{batch}")
+async def temp_image(request):
+    node_id = request.match_info["node_id"].strip()
     batch = int(request.match_info["batch"])
     st = PauseToMask.status_by_id.get(node_id)
     if not st:
@@ -138,11 +139,42 @@ async def open_in_krita(request):
 
     clipdir = os.path.join(folder_paths.get_input_directory(), "clipspace")
     path = os.path.join(clipdir, st["files"][batch])
+    return web.FileResponse(path, headers={"Cache-Control": "no-store"})
 
-    krita = shutil.which("krita") or shutil.which("krita.exe")
+
+@PromptServer.instance.routes.post("/api/pause_to_mask/upload_mask/{node_id}/{batch}")
+async def upload_mask(request):
+    # (same implementation you already have)
+    ...
+
+
+
+@PromptServer.instance.routes.post("/api/pause_to_mask/open_in_krita/{node_id}/{batch}")
+async def open_in_krita(request):
+    node_id = request.match_info["node_id"].strip()
+    batch = int(request.match_info["batch"])
+
+    st = PauseToMask.status_by_id.get(node_id)
+    if not st:
+        return web.json_response({"error": "not paused"}, status=404)
+
+    clipdir = os.path.join(folder_paths.get_input_directory(), "clipspace")
+    path = os.path.join(clipdir, st["files"][batch])
+
+    krita = (
+        os.environ.get("KRITA_PATH")
+        or shutil.which("krita")
+        or shutil.which("krita.exe")
+    )
+
     if krita:
-        subprocess.Popen([krita, path])
+        subprocess.Popen([krita, path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return web.json_response({"ok": True, "launcher": "krita"})
     else:
-        os.startfile(path) if sys.platform.startswith("win") else subprocess.Popen(["xdg-open", path])
-
-    return web.json_response({"ok": True})
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return web.json_response({"ok": True, "launcher": "default"})
