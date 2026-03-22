@@ -10,6 +10,7 @@ A simple custom node that:
 - Buttons right on the node
 - Cancel interrupts the current prompt run
 - Works with batches (though best with batch_size=1 for review)
+- **NEW**: Adds a sidebar panel that displays the current preview image
 
 ## Installation
 **ComfyUI Manager**
