@@ -17,6 +17,7 @@ from comfy.model_management import InterruptProcessingException
 
 REFRESH_INTERVAL_SECONDS = 2
 
+
 class PauseToMask:
     # node_id -> dict(state, files, mtimes, refresh_stop)
     status_by_id = {}
@@ -26,7 +27,7 @@ class PauseToMask:
         return {
             "required": {
                 "images": ("IMAGE",),
-                "invert_mask": ("BOOLEAN", {"default": False}),
+                # Removed invert_mask option from UI
                 "auto_refresh": ("BOOLEAN", {"default": True}),
             },
             "hidden": {
@@ -35,8 +36,9 @@ class PauseToMask:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "MASK")
-    RETURN_NAMES = ("images", "mask")
+    # Added second MASK output for inverted mask
+    RETURN_TYPES = ("IMAGE", "MASK", "MASK")
+    RETURN_NAMES = ("images", "mask", "mask_inverted")
     FUNCTION = "execute"
     CATEGORY = "image"
     OUTPUT_NODE = True
@@ -60,16 +62,22 @@ class PauseToMask:
             results.append({"filename": fname, "subfolder": "clipspace", "type": "input"})
         return results, (w, h)
 
-    def _mask_from_alpha(self, path, size, invert):
+    def _masks_from_alpha(self, path, size):
+        """
+        Returns (mask, mask_inverted) where:
+          - mask is derived from alpha channel
+          - mask_inverted = 1.0 - mask
+        """
         img = PILImage.open(path).convert("RGBA")
         alpha = img.getchannel("A")
         if alpha.size != size:
             alpha = alpha.resize(size, PILImage.BILINEAR)
+
         a = np.asarray(alpha, dtype=np.float32) / 255.0
-        mask = 1.0 - a
-        if invert:
-            mask = 1.0 - mask
-        return torch.from_numpy(mask)
+        mask = 1.0 - a  # ComfyUI mask convention from alpha
+        mask = torch.from_numpy(mask)
+        mask_inverted = 1.0 - mask
+        return mask, mask_inverted
 
     def _send_preview_ui(self, node_id, ui_images, refresh_token=None):
         PromptServer.instance.send_sync("executing", {"node": node_id, "prompt_id": None})
@@ -128,7 +136,9 @@ class PauseToMask:
             else:
                 stop_evt.wait(interval_s)
 
-    def execute(self, images, invert_mask=False, auto_refresh=True, id=None, prompt=None):
+    # NOTE: invert_mask is accepted ONLY for backward compatibility with older workflows.
+    # It is ignored since we always output both mask and inverted mask now.
+    def execute(self, images, auto_refresh=True, id=None, prompt=None, invert_mask=None):
         node_id = str(id)
 
         ui_images, (w, h) = self._save_images(images, node_id)
@@ -156,7 +166,11 @@ class PauseToMask:
 
         # Start refresh thread while paused
         if auto_refresh:
-            t = threading.Thread(target=self._refresh_worker, args=(node_id, REFRESH_INTERVAL_SECONDS), daemon=True)
+            t = threading.Thread(
+                target=self._refresh_worker,
+                args=(node_id, REFRESH_INTERVAL_SECONDS),
+                daemon=True,
+            )
             t.start()
 
         try:
@@ -168,14 +182,19 @@ class PauseToMask:
 
             # Build masks from alpha of edited PNGs
             masks = []
+            inv_masks = []
             for b in range(images.shape[0]):
                 try:
                     p = os.path.join(clipdir, self.status_by_id[node_id]["files"][b])
-                    masks.append(self._mask_from_alpha(p, (w, h), invert_mask))
+                    m, inv = self._masks_from_alpha(p, (w, h))
+                    masks.append(m)
+                    inv_masks.append(inv)
                 except Exception:
-                    masks.append(torch.zeros((h, w), dtype=torch.float32))
+                    m = torch.zeros((h, w), dtype=torch.float32)
+                    masks.append(m)
+                    inv_masks.append(1.0 - m)
 
-            return images, torch.stack(masks, dim=0)
+            return images, torch.stack(masks, dim=0), torch.stack(inv_masks, dim=0)
 
         finally:
             st = self.status_by_id.get(node_id)
