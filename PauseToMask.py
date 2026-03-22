@@ -156,7 +156,7 @@ class PauseToMask:
 
         # Start refresh thread while paused
         if auto_refresh:
-            t = threading.Thread(target=self._refresh_worker, args=(node_id, interval), daemon=True)
+            t = threading.Thread(target=self._refresh_worker, args=(node_id, REFRESH_INTERVAL_SECONDS), daemon=True)
             t.start()
 
         try:
