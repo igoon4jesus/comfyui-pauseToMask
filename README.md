@@ -59,7 +59,6 @@ When the node executes:
   `mask = 1.0 - alpha`
 
 - This matches standard ComfyUI masking semantics
-- Enable **Invert Mask** if you prefer the opposite behavior
 
 ---
 
@@ -68,7 +67,6 @@ When the node executes:
 | Input | Type | Description |
 |------|------|-------------|
 | `images` | IMAGE | Image(s) to pause and edit |
-| `invert_mask` | BOOLEAN | Invert the computed mask |
 | `auto_refresh` | BOOLEAN | Enable / disable preview auto‑refresh while paused |
 
 Auto‑refresh uses a **fixed 2‑second interval**.  
@@ -82,7 +80,7 @@ If this feels too aggressive, simply turn it off.
 |-------|------|
 | `images` | IMAGE |
 | `mask` | MASK |
-
+| `mask_inverted` | MASK |
 ---
 
 ## 🖥️ Krita Integration (Optional)
